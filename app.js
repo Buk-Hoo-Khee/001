@@ -714,6 +714,24 @@ function lastPlayForUid(uid){
   return best;
 }
 
+// The most recently played cards for a given player, capped at `n` —
+// each seat's on-table pile only ever shows up to this many cards, even
+// if their latest combo (a straight, quad, etc.) had more. Pulls from
+// progressively older plays if the newest play alone doesn't fill `n`.
+// Full history is still available via the history drawer (click the pile).
+function recentCardsForUid(uid, n=3){
+  const items = STATE.history.filter(h=>h.uid===uid).slice().sort((a,b)=>b.ts-a.ts);
+  const out = [];
+  for(const h of items){
+    for(const c of h.cards){
+      out.push(c);
+      if(out.length>=n) break;
+    }
+    if(out.length>=n) break;
+  }
+  return out;
+}
+
 // clicking your own pile (front-and-center) opens your play history
 $('last-combo').parentElement.style.cursor = 'pointer';
 $('last-combo').parentElement.title = 'ເບິ່ງປະຫວັດການລົງໄພ່ຂອງທ່ານ';
@@ -741,21 +759,27 @@ function renderGame(meta){
     seatDiv.style.transform = 'translate(-50%,-50%)';
     const passed = table && table.passSet && table.passSet[uid];
     const count = (STATE.oppCounts && STATE.oppCounts[uid]!==undefined) ? STATE.oppCounts[uid] : '?';
+    const isTurnNow = !!(table && table.currentUid===uid);
     seatDiv.innerHTML = `
-      <div class="avatar">${(p.name||'?').slice(0,1).toUpperCase()}</div>
+      <div class="avatar bell${isTurnNow ? ' ringing' : ''}" title="${isTurnNow ? 'ຮອບຂອງ' : 'ຍັງບໍ່ເຖິງຮອບ'}${escapeHtml(p.name?(' '+p.name):'')}">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor" aria-hidden="true">
+          <path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6.32V11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5S10.5 3.17 10.5 4v.68C7.65 5.36 6 7.92 6 11v4.68L4 17.68V19h16v-1.32l-2-2z"/>
+        </svg>
+      </div>
       <div class="name">${escapeHtml(p.name||'')}</div>
       <div class="hand-count">🂠 × <span data-count>${count}</span></div>
       ${passed ? '<div class="passed-tag">ຜ່ານ</div>' : ''}
     `;
 
     // each player gets their own discard pile in front of their seat —
-    // it only ever shows cards that player themself put down, and is
-    // clickable to open that player's full play history
+    // it shows only up to their 3 most recently played cards (never
+    // cards from other players' piles), and is clickable to open that
+    // player's full play history
     const isActivePile = !!(table && table.lastCombo && table.lastCombo.ownerUid === uid);
-    const lastPlay = lastPlayForUid(uid);
+    const recentCards = recentCardsForUid(uid, 3);
     const pileWrap = document.createElement('div');
-    pileWrap.className = 'seat-pile' + (isActivePile ? ' active-pile' : '') + (lastPlay ? '' : ' empty');
-    if(lastPlay) lastPlay.cards.forEach(c=>pileWrap.appendChild(cardEl(c, {size:'small'})));
+    pileWrap.className = 'seat-pile' + (isActivePile ? ' active-pile' : '') + (recentCards.length ? '' : ' empty');
+    recentCards.forEach(c=>pileWrap.appendChild(cardEl(c, {size:'small'})));
     pileWrap.title = 'ເບິ່ງປະຫວັດການລົງໄພ່';
     pileWrap.onclick = ()=> openHistoryDrawer(uid);
     seatDiv.appendChild(pileWrap);
@@ -772,10 +796,11 @@ function renderGame(meta){
   myPileEl.innerHTML = '';
   const myPileMeta = $('last-combo-meta');
   const myLastPlay = lastPlayForUid(MY_UID);
+  const myRecentCards = recentCardsForUid(MY_UID, 3);
   const myPileIsActive = !!(table && table.lastCombo && table.lastCombo.ownerUid === MY_UID);
   myPileEl.parentElement.classList.toggle('active-pile', myPileIsActive);
-  if(myLastPlay){
-    myLastPlay.cards.forEach(c=>myPileEl.appendChild(cardEl(c, {size:'small'})));
+  if(myRecentCards.length){
+    myRecentCards.forEach(c=>myPileEl.appendChild(cardEl(c, {size:'small'})));
     myPileMeta.textContent = `ໄພ່ຂອງທ່ານ • ${comboLabel(myLastPlay.type)}`;
   } else {
     myPileMeta.textContent = (table && table.freeLead && table.currentUid===MY_UID) ? 'ຮອບໃໝ່ — ລົງໄພ່ຫຍັງກໍໄດ້' : 'ໄພ່ຂອງທ່ານ';
