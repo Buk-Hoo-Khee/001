@@ -15,6 +15,11 @@
 const CONFIG = {
   cardsPerPlayer: 9,
   turnSeconds: 20,
+  // to beat a single card on the table with another single card, it must
+  // be the SAME SUIT and a higher rank — a different suit can only be
+  // played on top of a single via a "skill" combo (triple / straight, see
+  // below), never single-vs-single
+  singleMustFollowSuit: true,
   // a single 10/J/Q/K on the table can be "chopped" by a triple
   chopBigSingleWithTriple: true,
   bigSingleRanks: ['10','J','Q','K'],
@@ -25,6 +30,12 @@ const CONFIG = {
   superStraightBeatsTwoAndWins: true,
   // a four-of-a-kind found in a starting hand ("Super Quad") wins instantly
   quadInHandAutoWins: true,
+  // house rule: it is strictly forbidden to make a play that leaves you
+  // holding a SINGLE "2" card as the last card in your hand (any other
+  // 1-card, or 0, or 2+ cards remaining, is fine). Such plays are rejected
+  // outright; if that leaves a player with no legal move, they must pass
+  // (or get auto-passed on timeout).
+  forbidLastCardIsTwo: true,
 };
 
 const RANKS = ['3','4','5','6','7','8','9','10','J','Q','K','A','2'];
@@ -70,7 +81,7 @@ function classifyCombo(cardStrs){
   const cards = cardStrs.map(parseCard);
   const n = cards.length;
 
-  if(n === 1) return { type:'single', highVal: cards[0].val, len:1 };
+  if(n === 1) return { type:'single', highVal: cards[0].val, len:1, suit: cards[0].suit };
 
   if(n === 2){
     if(cards[0].rank === cards[1].rank && suitColor(cards[0].suit) === suitColor(cards[1].suit)){
@@ -97,6 +108,9 @@ function classifyCombo(cardStrs){
 function canBeat(play, last){
   if(!last) return { ok:true };
   if(play.type === last.type && play.len === last.len){
+    if(play.type === 'single' && CONFIG.singleMustFollowSuit){
+      return { ok: play.suit === last.suit && play.highVal > last.highVal };
+    }
     return { ok: play.highVal > last.highVal };
   }
   if(last.type === 'single'){
@@ -119,6 +133,17 @@ function findQuadInHand(hand){
   for(const c of hand){ const r = parseCard(c).rank; (byRank[r] = byRank[r]||[]).push(c); }
   for(const r in byRank) if(byRank[r].length === 4) return byRank[r];
   return null;
+}
+
+// House rule check: would playing `playedCards` out of `hand` leave the
+// player holding a single "2" as their last card? An instant win
+// (superstraight chopping a 2) is exempt — the game is already over so
+// the "stuck holding a lone 2" situation never actually happens.
+function leavesForbiddenLastTwo(hand, playedCards, instantWin){
+  if(!CONFIG.forbidLastCardIsTwo) return false;
+  if(instantWin) return false;
+  const remaining = hand.filter(c=>!playedCards.includes(c));
+  return remaining.length === 1 && parseCard(remaining[0]).rank === '2';
 }
 
 function sortHand(hand, mode){
@@ -148,6 +173,7 @@ function candidateCombosContaining(hand, cardStr, lastCombo){
     if(combo.type === 'quad') return; // quad isn't a normal playable move
     const res = canBeat(combo, lastCombo);
     if(!res.ok) return;
+    if(leavesForbiddenLastTwo(hand, cards, res.instantWin)) return; // can't leave a lone "2" as the last card
     seen.add(key);
     out.push({ cards, combo, chop: !!res.chop, instantWin: !!res.instantWin });
   };
@@ -588,6 +614,8 @@ function applyAction(room, action){
     if(!combo || combo.type==='quad') return;
     const result = canBeat(combo, table.freeLead ? null : table.lastCombo);
     if(!result.ok) return;
+    // house rule: never allow ending a play holding a lone "2" as the last card
+    if(leavesForbiddenLastTwo(hand, cards, result.instantWin)) return;
 
     // remove cards from hand
     const newHand = hand.filter(c=>!cards.includes(c));
@@ -609,7 +637,7 @@ function applyAction(room, action){
       return;
     }
 
-    table.lastCombo = { type: combo.type, len: combo.len, highVal: combo.highVal, cards, ownerUid: uid };
+    table.lastCombo = { type: combo.type, len: combo.len, highVal: combo.highVal, suit: combo.suit || null, cards, ownerUid: uid };
     table.freeLead = false;
     // passSet carries over within the same trick — anyone who already
     // passed stays skipped until the trick resets (auto-pass house rule)
@@ -658,13 +686,29 @@ function startHostWatchdog(roomId){
 
     let action;
     if(table.freeLead){
-      const sorted = sortHand(hand, 'rank');
-      action = { uid, kind:'play', cards:[sorted[0]] };
+      action = { uid, kind:'play', cards: pickAutoLead(hand) };
     } else {
       action = { uid, kind:'pass' };
     }
     await ref.transaction((r)=>{ if(!r) return r; applyAction(r, action); return r; });
   }, 1000);
+}
+
+// Picks a safe forced lead for the timeout watchdog: normally the single
+// smallest card, but if that would leave the player holding a lone "2"
+// as their last card (forbidden), try the next-smallest single instead,
+// or dump the whole hand as one combo if no single works. Falls back to
+// the plain smallest single as a last resort so the game never stalls.
+function pickAutoLead(hand){
+  const sorted = sortHand(hand, 'rank');
+  for(const c of sorted){
+    if(!leavesForbiddenLastTwo(hand, [c], false)) return [c];
+  }
+  // every single-card lead would leave a lone "2" behind — try playing
+  // the whole hand at once instead, so nothing is left over
+  const wholeCombo = classifyCombo(hand);
+  if(wholeCombo && wholeCombo.type !== 'quad') return hand.slice();
+  return [sorted[0]]; // unavoidable edge case fallback
 }
 
 /* Client -> intent helpers (writes to actions/ ; host consumes them). If
@@ -703,8 +747,8 @@ function cardEl(cardStr, opts={}){
   return div;
 }
 
-// Most recent combo a given player has put down (used to render their own
-// discard pile in front of their seat — piles never merge between players).
+// Most recent combo a given player has put down (used for the pile's
+// meta label — combo type, chop, etc).
 function lastPlayForUid(uid){
   let best = null;
   for(const h of STATE.history){
@@ -714,22 +758,21 @@ function lastPlayForUid(uid){
   return best;
 }
 
-// The most recently played cards for a given player, capped at `n` —
-// each seat's on-table pile only ever shows up to this many cards, even
-// if their latest combo (a straight, quad, etc.) had more. Pulls from
-// progressively older plays if the newest play alone doesn't fill `n`.
-// Full history is still available via the history drawer (click the pile).
-function recentCardsForUid(uid, n=3){
-  const items = STATE.history.filter(h=>h.uid===uid).slice().sort((a,b)=>b.ts-a.ts);
-  const out = [];
-  for(const h of items){
+// The pile shown in front of each seat is capped at the 3 most recently
+// played cards for that player (not the 3 most recent *plays* — a single
+// 5-card straight would still only show its last 3 cards). Walk the
+// player's history newest-first and collect cards until we hit the cap;
+// tapping the pile still opens the full history via openHistoryDrawer.
+function lastCardsForUid(uid, limit=3){
+  const entries = STATE.history.filter(h=>h.uid===uid).sort((a,b)=>b.ts-a.ts);
+  const cards = [];
+  for(const h of entries){
     for(const c of h.cards){
-      out.push(c);
-      if(out.length>=n) break;
+      cards.push(c);
+      if(cards.length >= limit) return cards;
     }
-    if(out.length>=n) break;
   }
-  return out;
+  return cards;
 }
 
 // clicking your own pile (front-and-center) opens your play history
@@ -759,27 +802,23 @@ function renderGame(meta){
     seatDiv.style.transform = 'translate(-50%,-50%)';
     const passed = table && table.passSet && table.passSet[uid];
     const count = (STATE.oppCounts && STATE.oppCounts[uid]!==undefined) ? STATE.oppCounts[uid] : '?';
-    const isTurnNow = !!(table && table.currentUid===uid);
     seatDiv.innerHTML = `
-      <div class="avatar bell${isTurnNow ? ' ringing' : ''}" title="${isTurnNow ? 'ຮອບຂອງ' : 'ຍັງບໍ່ເຖິງຮອບ'}${escapeHtml(p.name?(' '+p.name):'')}">
-        <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor" aria-hidden="true">
-          <path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6.32V11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5S10.5 3.17 10.5 4v.68C7.65 5.36 6 7.92 6 11v4.68L4 17.68V19h16v-1.32l-2-2z"/>
-        </svg>
-      </div>
+      <div class="avatar">${(p.name||'?').slice(0,1).toUpperCase()}<div class="turn-bell" title="ຮອດຕາຫຼິ້ນ">🔔</div></div>
       <div class="name">${escapeHtml(p.name||'')}</div>
       <div class="hand-count">🂠 × <span data-count>${count}</span></div>
       ${passed ? '<div class="passed-tag">ຜ່ານ</div>' : ''}
     `;
 
     // each player gets their own discard pile in front of their seat —
-    // it shows only up to their 3 most recently played cards (never
-    // cards from other players' piles), and is clickable to open that
-    // player's full play history
+    // it only ever shows cards that player themself put down, and is
+    // clickable to open that player's full play history
     const isActivePile = !!(table && table.lastCombo && table.lastCombo.ownerUid === uid);
-    const recentCards = recentCardsForUid(uid, 3);
+    const lastCards = lastCardsForUid(uid);
     const pileWrap = document.createElement('div');
-    pileWrap.className = 'seat-pile' + (isActivePile ? ' active-pile' : '') + (recentCards.length ? '' : ' empty');
-    recentCards.forEach(c=>pileWrap.appendChild(cardEl(c, {size:'small'})));
+    pileWrap.className = 'seat-pile' + (isActivePile ? ' active-pile' : '') + (lastCards.length ? '' : ' empty');
+    // render oldest -> newest so the most recently played card ends up last
+    // in the DOM (and therefore stacked visually on top, per CSS below)
+    lastCards.slice().reverse().forEach(c=>pileWrap.appendChild(cardEl(c, {size:'small'})));
     pileWrap.title = 'ເບິ່ງປະຫວັດການລົງໄພ່';
     pileWrap.onclick = ()=> openHistoryDrawer(uid);
     seatDiv.appendChild(pileWrap);
@@ -796,11 +835,12 @@ function renderGame(meta){
   myPileEl.innerHTML = '';
   const myPileMeta = $('last-combo-meta');
   const myLastPlay = lastPlayForUid(MY_UID);
-  const myRecentCards = recentCardsForUid(MY_UID, 3);
+  const myLastCards = lastCardsForUid(MY_UID);
   const myPileIsActive = !!(table && table.lastCombo && table.lastCombo.ownerUid === MY_UID);
   myPileEl.parentElement.classList.toggle('active-pile', myPileIsActive);
-  if(myRecentCards.length){
-    myRecentCards.forEach(c=>myPileEl.appendChild(cardEl(c, {size:'small'})));
+  if(myLastPlay){
+    // oldest -> newest, so the newest card lands on top of the stack visually
+    myLastCards.slice().reverse().forEach(c=>myPileEl.appendChild(cardEl(c, {size:'small'})));
     myPileMeta.textContent = `ໄພ່ຂອງທ່ານ • ${comboLabel(myLastPlay.type)}`;
   } else {
     myPileMeta.textContent = (table && table.freeLead && table.currentUid===MY_UID) ? 'ຮອບໃໝ່ — ລົງໄພ່ຫຍັງກໍໄດ້' : 'ໄພ່ຂອງທ່ານ';
@@ -820,6 +860,19 @@ function renderGame(meta){
   $('status-msg').textContent = statusMsg;
   $('btn-pass').disabled = !isMyTurn || (table && table.freeLead);
   $('btn-play').disabled = !isMyTurn;
+
+  // red "My Turn" popup badge, shown right beside the cards on the table
+  // (attached to the player's own center-pile) whenever it becomes their turn
+  const turnBadge = $('my-turn-badge');
+  const showTurnBadge = STATE.status === 'playing' && isMyTurn;
+  turnBadge.classList.toggle('hidden', !showTurnBadge);
+  if(showTurnBadge && STATE._lastTurnBadgeUid !== (table.currentUid||'freeLead')+String(table.deadline)){
+    // retrigger the pop animation each time it becomes our turn again
+    turnBadge.classList.remove('pop');
+    void turnBadge.offsetWidth; // force reflow to restart animation
+    turnBadge.classList.add('pop');
+  }
+  STATE._lastTurnBadgeUid = showTurnBadge ? (table.currentUid||'freeLead')+String(table.deadline) : null;
 
   renderTimer();
   renderHand();
@@ -906,6 +959,10 @@ $('btn-play').onclick = ()=>{
   if(!combo || combo.type==='quad'){ toast('ໄພ່ທີ່ເລືອກລົງນຳກັນບໍ່ໄດ້'); return; }
   const res = canBeat(combo, lastCombo);
   if(!res.ok){ toast('ໄພ່ນີ້ນ້ອຍ ຫຼື ບໍ່ຖືກແບບກັບໄພ່ເທິງໂຕະ'); return; }
+  if(leavesForbiddenLastTwo(STATE.myHand, sel, res.instantWin)){
+    toast('ຫ້າມລົງໄພ່ທີ່ຈະເຮັດໃຫ້ເຫຼືອໄພ່ເລກ 2 ໄວ້ໃບສຸດທ້າຍ — ເລືອກໄພ່ອື່ນ ຫຼື ກົດຜ່ານ');
+    return;
+  }
   submitPlay(sel);
 };
 
